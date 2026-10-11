@@ -21,14 +21,14 @@ HEADER_API_KEY = "453299022fd70f9329bb0c2bf5fa6a75dea07dc6"
 cached_token = None
 token_expiry_time = 0
 
+# البوابات المتاحة لهيئة الغذاء والدواء: المنفذ القياسي 443 أولاً ثم 9002
+SFDA_BASE_URLS = [
+    "https://apis.sfda.gov.sa",
+    "https://apis.sfda.gov.sa:9002"
+]
+
 def get_proxies():
-    """
-    جلب إعدادات البروكسي السعودي من متغيرات البيئة في Vercel أو البيئة المحلية
-    مثال:
-    SAUDI_PROXY=http://user:password@proxy-ip:port
-    أو SOCKS5:
-    SAUDI_PROXY=socks5://user:password@proxy-ip:port
-    """
+    """قراءة البروكسي إن وجد (اختياري)"""
     proxy = os.environ.get("SAUDI_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
     if proxy and proxy.strip():
         proxy_clean = proxy.strip()
@@ -38,27 +38,44 @@ def get_proxies():
         }
     return None
 
+def make_sfda_request(endpoint_path, headers, timeout=8):
+    """
+    محاولة الاتصال بالهيئة عبر المنفذ القياسي 443 أولاً، ثم المنفذ البديل 9002
+    """
+    proxies = get_proxies()
+    last_exception = None
+    for base in SFDA_BASE_URLS:
+        url = f"{base}{endpoint_path}"
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout, verify=False, proxies=proxies)
+            if r.status_code == 200:
+                return r
+        except Exception as e:
+            last_exception = e
+            continue
+    if last_exception:
+        print(f"SFDA Request failed on all bases for {endpoint_path}: {last_exception}")
+    return None
+
 def get_token():
     global cached_token, token_expiry_time
     now = time.time()
     if cached_token and now < token_expiry_time:
         return cached_token
 
-    url = "https://apis.sfda.gov.sa:9002/tameni/v3/api/tokens/GetAccess"
     headers = {
         "User-Agent": "Dart/3.0 (dart:io)",
         "HEADER_API_KEY": HEADER_API_KEY,
     }
-    proxies = get_proxies()
-    try:
-        r = requests.get(url, headers=headers, timeout=12, verify=False, proxies=proxies)
-        if r.status_code == 200:
+    r = make_sfda_request("/tameni/v3/api/tokens/GetAccess", headers=headers, timeout=8)
+    if r and r.status_code == 200:
+        try:
             data = r.json()
             cached_token = data.get("token")
             token_expiry_time = now + 1800
             return cached_token
-    except Exception as e:
-        print(f"Error fetching token: {e}")
+        except Exception as e:
+            print(f"Error parsing token json: {e}")
     return None
 
 def extract_gtin_from_code(code):
@@ -79,24 +96,12 @@ def home():
 def health_endpoint():
     proxies = get_proxies()
     has_proxy = bool(proxies)
-    masked_proxy = None
-    if has_proxy:
-        p = proxies["https"]
-        if "@" in p:
-            scheme, rest = p.split("://", 1)
-            creds, host_port = rest.split("@", 1)
-            masked_proxy = f"{scheme}://***:***@{host_port}"
-        else:
-            masked_proxy = p
-
-    # فحص سريع للاتصال بهيئة الغذاء والدواء
     token = get_token()
     return jsonify({
         "status": "online",
         "proxy_configured": has_proxy,
-        "proxy_address": masked_proxy,
         "sfda_api_connected": bool(token),
-        "message": "متصل بالهيئة بنجاح" if token else "تعذر الاتصال بسيرفرات الهيئة. تأكد من تفعيل بروكسي سعودي (SAUDI_PROXY) إذا كنت على Vercel."
+        "message": "متصل بسيرفرات الهيئة بنجاح" if token else "تعذر الوصول لسيرفرات الهيئة، جار المحاولة تلقائياً"
     })
 
 @app.route('/api/scan', methods=['GET', 'POST'])
@@ -119,20 +124,16 @@ def scan_endpoint():
 
     token = get_token()
     if not token:
-        proxies = get_proxies()
-        error_msg = "تعذر الحصول على توكن الهيئة."
-        if not proxies:
-            error_msg += " (تنبيه: سيرفرات الهيئة تحجب الاتصالات من خارج السعودية. يرجى إضافة متغير SAUDI_PROXY في Vercel Dashboard)."
-        else:
-            error_msg += " (تأكد من صلاحية البروكسي السعودي المدخل في SAUDI_PROXY)."
-        return jsonify({"success": False, "error": error_msg}), 500
+        return jsonify({
+            "success": False, 
+            "error": "تعذر الاتصال بسيرفر الهيئة حالياً. يرجى المحاولة بعد لحظات."
+        }), 500
 
     auth_headers = {
         "User-Agent": "Dart/3.0 (dart:io)",
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
     }
-    proxies = get_proxies()
 
     reg_no = None
 
@@ -145,9 +146,9 @@ def scan_endpoint():
         rsd_payload = code
 
     try:
-        rsd_url = f"https://apis.sfda.gov.sa:9002/v2/rsd/Drugs/status?qrCode={urllib.parse.quote(rsd_payload)}"
-        r_rsd = requests.get(rsd_url, headers=auth_headers, timeout=10, verify=False, proxies=proxies)
-        if r_rsd.status_code == 200:
+        endpoint = f"/v2/rsd/Drugs/status?qrCode={urllib.parse.quote(rsd_payload)}"
+        r_rsd = make_sfda_request(endpoint, headers=auth_headers, timeout=8)
+        if r_rsd and r_rsd.status_code == 200:
             rsd_json = r_rsd.json().get('data', {})
             reg_no = rsd_json.get("druG_REGISTRATION_NO")
             result["rsd_info"] = {
@@ -161,10 +162,10 @@ def scan_endpoint():
 
     # 2. البحث برقم التسجيل في Solr لجلب السعر لايف
     if reg_no:
-        solr_url = f"https://apis.sfda.gov.sa:9002/v1/Solr/Search?q=RegisterNumber%3A{urllib.parse.quote(str(reg_no))}"
+        endpoint = f"/v1/Solr/Search?q=RegisterNumber%3A{urllib.parse.quote(str(reg_no))}"
         try:
-            r_solr = requests.get(solr_url, headers=auth_headers, timeout=10, verify=False, proxies=proxies)
-            if r_solr.status_code == 200:
+            r_solr = make_sfda_request(endpoint, headers=auth_headers, timeout=8)
+            if r_solr and r_solr.status_code == 200:
                 docs = r_solr.json().get('data', {}).get('response', {}).get('docs', [])
                 if docs:
                     result["drug_info"] = docs[0]
@@ -173,10 +174,10 @@ def scan_endpoint():
 
     # 3. إذا لم يرجع بالرقم، ابحث بالاسم أو الباركود
     if not result["drug_info"]:
-        solr_url = f"https://apis.sfda.gov.sa:9002/v1/Solr/Search?q={urllib.parse.quote(code)}"
+        endpoint = f"/v1/Solr/Search?q={urllib.parse.quote(code)}"
         try:
-            r_solr = requests.get(solr_url, headers=auth_headers, timeout=10, verify=False, proxies=proxies)
-            if r_solr.status_code == 200:
+            r_solr = make_sfda_request(endpoint, headers=auth_headers, timeout=8)
+            if r_solr and r_solr.status_code == 200:
                 docs = r_solr.json().get('data', {}).get('response', {}).get('docs', [])
                 if docs:
                     result["drug_info"] = docs[0]
